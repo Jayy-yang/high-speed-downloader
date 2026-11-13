@@ -3,7 +3,7 @@
 面向 Windows 的图形化多线程分片下载工具：**aiohttp 异步分片下载 + requests/threading 同步兜底**，支持断点续传、并发控制、失败分片隔离与降级日志。下载引擎自己实现，不封装 aria2 / wget 等任何外部程序。
 
 [![Release](https://img.shields.io/badge/release-v1.0.1-blue)](../../releases/latest)
-[![Platform](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-0078D4)](#系统要求)
+[![Platform](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-0078D4)](#下载与安装)
 [![Python](https://img.shields.io/badge/python-3.9%2B-3776AB)](https://www.python.org/)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
@@ -154,7 +154,7 @@ CDN 反爬或链接需要 Cookie/Referer，也可能签名过期；浏览器 UA 
 要求 Python 3.9+（开发环境实测 3.14），tkinter 由 Windows 官方安装包自带。
 
 ```powershell
-git clone <your-repo-url>
+git clone https://github.com/Jayy-yang/high-speed-downloader.git
 cd high-speed-downloader
 pip install -r requirements.txt
 python high_speed_downloader.py
