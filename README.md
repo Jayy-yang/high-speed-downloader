@@ -1,4 +1,4 @@
-# ShardDownloader · 分片下载器
+# HighSpeedDownloader · 高速分片下载器
 
 面向 Windows 的图形化多线程分片下载工具：**aiohttp 异步分片下载 + requests/threading 同步兜底**，支持断点续传、并发控制、失败分片隔离与降级日志。下载引擎自己实现，不封装 aria2 / wget 等任何外部程序。
 
@@ -29,14 +29,14 @@
 
 ## 下载与安装
 
-前往 **[Releases](../../releases/latest)** 下载 `ShardDownloader.exe`（约 20 MB），双击即用。
+前往 **[Releases](../../releases/latest)** 下载 `HighSpeedDownloader.exe`（约 20 MB），双击即用。
 
 | 项 | 说明 |
 | --- | --- |
 | 系统要求 | Windows 10 / 11（x64）；无需 Python、无需运行库 |
 | 安装 | 免安装，单个 exe，可放在任意目录 |
-| 首次启动 | 自解压运行时到 `%LOCALAPPDATA%\ShardDownloader\runtime`，约 2–4 秒 |
-| 卸载 | 删除 exe；如需彻底清理，再删除 `%LOCALAPPDATA%\ShardDownloader` 与 `%APPDATA%\ShardDownloader` |
+| 首次启动 | 自解压运行时到临时目录，约 2–4 秒 |
+| 卸载 | 删除 exe；如需彻底清理，再删除 `%APPDATA%\HighSpeedDownloader` |
 
 > **SmartScreen 提示**：本程序未做代码签名，Windows 可能提示“Windows 已保护你的电脑”。点 **更多信息 → 仍要运行** 即可；也可自行从源码打包（见[自行打包](#自行打包)）。
 >
@@ -78,7 +78,7 @@
 
 - 关闭窗口时自动记住：分片数、并发连接、重试次数、分片大小 MB、默认保存目录；下次启动原样恢复。
 - 下载链接与“保存到”里的文件名**不记忆**；填入链接后自动按“保存目录 + 真实文件名”生成。
-- 配置持久化在 `%APPDATA%\ShardDownloader\config.json`，设置窗口会显示实际路径；删除该文件即恢复默认。
+- 配置持久化在 `%APPDATA%\HighSpeedDownloader\config.json`，设置窗口会显示实际路径；删除该文件即恢复默认。
 - **默认保存目录**取系统“下载”目录：即使用户把“下载”重定向到其他盘也能识别，取不到时退回 `~/Downloads`。
 - 手工改过文件名后，后续解析结果不会覆盖你的输入。
 
@@ -155,11 +155,11 @@ CDN 反爬或链接需要 Cookie/Referer，也可能签名过期；浏览器 UA 
 
 ```powershell
 git clone <your-repo-url>
-cd shard_downloader
+cd high-speed-downloader
 pip install -r requirements.txt
-python shard_downloader.py
+python high_speed_downloader.py
 # 或
-pythonw shard_downloader.py   # 不显示控制台
+pythonw high_speed_downloader.py   # 不显示控制台
 ```
 
 Windows 也可以双击 `start.bat`。
@@ -169,7 +169,7 @@ Windows 也可以双击 `start.bat`。
 ```powershell
 pip install pyinstaller
 powershell -NoProfile -ExecutionPolicy Bypass -File .\build_exe.ps1
-# 产物：dist\ShardDownloader.exe
+# 产物：dist\HighSpeedDownloader.exe
 ```
 
 打包参数为 `--onefile --windowed --noupx`，内嵌 aiohttp / requests 的 DLL 与 Tcl/Tk，不依赖系统 Python。版本号需在 `version_info.txt` 与源码 `APP_VERSION` 两处同步修改。
@@ -177,22 +177,22 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\build_exe.ps1
 ## 项目结构
 
 ```
-shard_downloader/
-├─ shard_downloader.py      # 源码：GUI + 下载引擎（含完整注释）
-├─ build_exe.ps1            # 一键打包脚本
-├─ ShardDownloader.spec     # PyInstaller 配置
-├─ version_info.txt         # EXE 版本资源
-├─ requirements.txt         # 运行依赖
-├─ start.bat                # 源码一键启动
-├─ download-arrow.ico       # 程序图标
-├─ gui_preview.png          # 界面截图
-└─ tools/                   # 开发期自测脚本（不属于发行物）
-   ├─ test_server.py        # 本地测试服务：Range / 不支持 Range / 故障注入 / 限速
-   ├─ run_headless.py       # 场景验证：range / subsplit / norange / flaky / resume
-   ├─ run_settings_test.py  # 设置、记忆、上限、证书开关共 13 项
-   ├─ frozen_selftest.py    # 冻结环境自检（打包后验证无 Python 可运行）
-   ├─ download_real.py      # 真实外网 URL 验收 + 首尾字节抽样比对
-   └─ screenshot_gui.ps1    # 启动 GUI 并截图
+high-speed-downloader/
+├─ high_speed_downloader.py  # 源码：GUI + 下载引擎（含完整注释）
+├─ build_exe.ps1             # 一键打包脚本
+├─ HighSpeedDownloader.spec  # PyInstaller 配置
+├─ version_info.txt          # EXE 版本资源
+├─ requirements.txt          # 运行依赖
+├─ start.bat                 # 源码一键启动
+├─ download-arrow.ico        # 程序图标
+├─ gui_preview.png           # 界面截图
+└─ tools/                    # 开发期自测脚本（不属于发行物）
+   ├─ test_server.py         # 本地测试服务：Range / 不支持 Range / 故障注入 / 限速
+   ├─ run_headless.py        # 场景验证：range / subsplit / norange / flaky / resume
+   ├─ run_settings_test.py   # 设置、记忆、上限、证书开关共 13 项
+   ├─ frozen_selftest.py     # 冻结环境自检（打包后验证无 Python 可运行）
+   ├─ download_real.py       # 真实外网 URL 验收 + 首尾字节抽样比对
+   └─ screenshot_gui.ps1     # 启动 GUI 并截图
 ```
 
 ## 已知限制
@@ -209,6 +209,6 @@ shard_downloader/
 
 ## English
 
-ShardDownloader is a Windows GUI downloader with aiohttp-based async chunked downloading and a requests/threading fallback. It supports resumable downloads, configurable concurrency, per-shard retry with isolated degradation, real-time progress, and a single-file `ShardDownloader.exe` that runs without Python installed.
+HighSpeedDownloader is a Windows GUI downloader with aiohttp-based async chunked downloading and a requests/threading fallback. It supports resumable downloads, configurable concurrency, per-shard retry with isolated degradation, real-time progress, and a single-file `HighSpeedDownloader.exe` that runs without Python installed.
 
-Download the latest `ShardDownloader.exe` from [Releases](../../releases/latest), double-click to run, paste a URL, and start downloading.
+Download the latest `HighSpeedDownloader.exe` from [Releases](../../releases/latest), double-click to run, paste a URL, and start downloading.

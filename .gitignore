@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+build/
+dist/
+*.spec.bak
+tools/_tmp_settings/
+out/
+*.parts/
+.venv/
