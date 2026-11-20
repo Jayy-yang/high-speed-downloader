@@ -264,6 +264,16 @@ class Engine:
         except asyncio.CancelledError:
             emit({"event": "cancelled"})
             raise
+        except PermissionError as exc:
+            # 隔离区目录权限问题最常见：旧版本或别的账号建过 .incoming，ACL 把自己也挡在外面
+            LOGGER.exception("隔离区目录不可写")
+            emit_error(
+                f"无法写入 eD2K 隔离区目录：{exc}\n"
+                f"请删除下载目录下的 .incoming 文件夹（或换一个下载目录）后重试",
+                fatal=False,
+                detail=traceback.format_exc(limit=3),
+            )
+            return
         except Exception as exc:
             LOGGER.exception("下载失败")
             emit_error(f"eD2K 下载失败：{exc}", fatal=False, detail=traceback.format_exc(limit=3))
