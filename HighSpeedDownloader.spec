@@ -3,7 +3,7 @@
 
 a = Analysis(
     ['C:/Users/Jayy_yang/Documents/deepseek-harness/default-workspace/program/high-speed-downloader/high_speed_downloader.py'],
-    pathex=[],
+    pathex=['C:/Users/Jayy_yang/Documents/deepseek-harness/default-workspace/.deps'],
     binaries=[],
     datas=[],
     hiddenimports=[],

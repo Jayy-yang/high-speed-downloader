@@ -1,4 +1,9 @@
 # 临时脚本：启动 GUI、截取窗口图像、关闭进程（仅开发期验证用）
+param(
+    [string]$Entry = 'high_speed_downloader.py',
+    [string]$OutFile = 'gui_preview.png',
+    [string]$ExePath = ''
+)
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Drawing
 Add-Type -AssemblyName System.Windows.Forms
@@ -26,8 +31,12 @@ $env:PYTHONPATH = $deps
 $env:PYTHONUTF8 = '1'
 
 Get-Process python,pythonw -ErrorAction SilentlyContinue | Stop-Process -Force
-$proc = Start-Process -FilePath $python -ArgumentList 'high_speed_downloader.py' `
-    -WorkingDirectory $root -PassThru
+if ($ExePath) {
+    $proc = Start-Process -FilePath $ExePath -WorkingDirectory (Split-Path -Parent $ExePath) -PassThru
+} else {
+    $proc = Start-Process -FilePath $python -ArgumentList $Entry `
+        -WorkingDirectory $root -PassThru
+}
 try {
     Start-Sleep -Milliseconds 1500
     $handle = [IntPtr]::Zero
@@ -55,7 +64,7 @@ try {
     $bitmap = New-Object System.Drawing.Bitmap $width, $height
     $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
     $graphics.CopyFromScreen($rect.Left, $rect.Top, 0, 0, $bitmap.Size)
-    $out = Join-Path $root 'gui_preview.png'
+    $out = Join-Path $root $OutFile
     $bitmap.Save($out, [System.Drawing.Imaging.ImageFormat]::Png)
     $graphics.Dispose()
     $bitmap.Dispose()
@@ -64,3 +73,4 @@ try {
 finally {
     if (-not $proc.HasExited) { Stop-Process -Id $proc.Id -Force }
 }
+

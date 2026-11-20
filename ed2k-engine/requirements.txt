@@ -1,0 +1,10 @@
+# eD2K 组件依赖（均已 vendor 到 vendor/，构建时无需联网安装）
+#
+# ed2k-client 0.1.0  —— eD2K/Kad 协议实现，GPL-3.0-or-later
+#   https://pypi.org/project/ed2k-client/0.1.0/
+#   https://github.com/akhmialeuski/ed2k-client
+ed2k-client==0.1.0
+
+# pycryptodome 4.4.0 —— MD4/SHA1（eD2K 哈希与 AICH），公有领域 / BSD-2-Clause
+#   cp39-abi3-win_amd64 wheel，可在 Python 3.9+ 的 64 位 Windows 上运行
+pycryptodome==4.4.0

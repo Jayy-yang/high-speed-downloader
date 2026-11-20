@@ -36,10 +36,13 @@ import queue
 import re
 import shutil
 import ssl
+import subprocess
 import sys
+import tempfile
 import threading
 import time
 import tkinter as tk
+import zipfile
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
@@ -56,7 +59,13 @@ from requests.adapters import HTTPAdapter
 # --------------------------------------------------------------------------- #
 
 APP_TITLE = "HighSpeedDownloader · aiohttp + requests"
-APP_VERSION = "1.0.1"
+APP_VERSION = "1.1.1"
+
+# eD2K 组件：独立进程、独立发布物（GPL-3.0），主程序只通过 stdin/stdout 的 JSON 行与它通信
+ED2K_PREFIX = "ed2k://"
+ED2K_ENGINE_NAME = "Ed2kEngine.exe"
+ED2K_DEFAULT_TCP_PORT = 4662
+ED2K_DEFAULT_UDP_PORT = 4672
 
 # 常规 Chrome 浏览器 UA，避免部分 CDN 直接拒绝脚本 UA
 DEFAULT_UA = (
@@ -221,6 +230,30 @@ def default_output_name(url: str, suggested: Optional[str] = None) -> str:
     name = unquote(Path(urlparse(url).path).name)
     name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name).strip(" .")
     return name or "download.bin"
+
+
+def is_ed2k_link(text: str) -> bool:
+    """判断输入是不是 ed2k:// 链接。"""
+    return text.strip().lower().startswith(ED2K_PREFIX)
+
+
+def parse_ed2k_link(link: str) -> Tuple[str, int]:
+    """从 ``ed2k://|file|名字|大小|哈希|/`` 里取出 (文件名, 字节数)。
+
+    链接不合法时给出兜底名字与 0 大小，交给引擎再报错，避免界面层直接崩。
+    """
+    parts = link.strip().split("|")
+    name, size = "ed2k-download.bin", 0
+    if len(parts) >= 5 and parts[1].strip().lower() == "file":
+        try:
+            name = unquote(parts[2]).strip() or name
+        except Exception:
+            pass
+        try:
+            size = max(0, int(parts[3]))
+        except ValueError:
+            size = 0
+    return sanitize_filename(name), size
 
 
 def system_downloads_dir() -> Path:
@@ -1743,12 +1776,263 @@ class DownloadEngine:
 # 图形界面
 # --------------------------------------------------------------------------- #
 
+class Ed2kBridge:
+    """eD2K 引擎（独立 GPL-3.0 组件）的子进程管理者。
+
+    主程序与引擎只通过 stdin/stdout 的按行 JSON 通信，不共享内存、不互相 import，
+    因此主程序保持 MIT、组件单独以 GPL 分发（详见 README「eD2K 组件」一节）。
+
+    线程模型：stdout/stderr 各一个读线程，解析出的事件转成回调；界面侧只读
+    ``snapshot()`` / ``status_text()``，不需要自己加锁。
+    """
+
+    def __init__(self, on_event: Callable[[str, str], None]) -> None:
+        # on_event(kind, text)：kind 与 DownloadEngine 的事件类型保持一致（info/degrade/error/done/stopped）
+        self.on_event = on_event
+        self.process: Optional[subprocess.Popen] = None
+        self.running = False
+        self.error = ""
+        self.name = ""
+        self.size = 0
+        self.verified = 0
+        self.peers = 0
+        self.sources = 0
+        self.servers = 0
+        self.kad_contacts = 0
+        self.shared = 0
+        self.low_id = False
+        self.listen_port: Optional[int] = None
+        self.seeding = 0
+        self.speed = 0.0
+        self._samples: "deque[Tuple[float, int]]" = deque()
+        self._write_lock = threading.Lock()
+        self._stopping = False
+        self._finished = False
+
+    # ------------------------------------------------------------------ 定位
+
+    @staticmethod
+    def find_engine(settings: Optional[dict] = None) -> Optional[Path]:
+        """找到 eD2K 引擎：优先用户配置，其次安装目录/组件目录，最后源码目录。"""
+        candidates: List[Path] = []
+        configured = (settings or {}).get("ed2k_engine")
+        if isinstance(configured, str) and configured.strip():
+            candidates.append(Path(configured).expanduser())
+        if getattr(sys, "frozen", False):
+            base = Path(sys.executable).resolve().parent
+            candidates += [base / ED2K_ENGINE_NAME, base / "ed2k" / ED2K_ENGINE_NAME]
+        else:
+            here = Path(__file__).resolve().parent
+            candidates += [
+                here / ED2K_ENGINE_NAME,
+                here / "ed2k" / ED2K_ENGINE_NAME,
+                here / "ed2k-engine" / "engine.py",
+            ]
+        for item in candidates:
+            if item.is_file():
+                return item
+        return None
+
+    @staticmethod
+    def engine_version_hint(engine: Optional[Path]) -> str:
+        """给设置页显示的一行组件信息。"""
+        if engine is None:
+            return "未安装"
+        return str(engine)
+
+    # ------------------------------------------------------------------ 生命周期
+
+    def start(self, spec: dict) -> None:
+        """拉起引擎并下发 start 指令；失败抛 DownloadError。"""
+        engine = self.find_engine(spec.get("_settings"))
+        if engine is None:
+            raise DownloadError(
+                "未找到 eD2K 组件（Ed2kEngine.exe）。请下载组件，或改用安装包/直装包版本。"
+            )
+        command = [str(engine)]
+        if engine.suffix.lower() == ".py":
+            command = [sys.executable, str(engine)]
+        creationflags = 0x08000000 if sys.platform == "win32" else 0  # CREATE_NO_WINDOW
+        try:
+            self.process = subprocess.Popen(
+                command,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
+                creationflags=creationflags,
+            )
+        except OSError as exc:
+            raise DownloadError(f"无法启动 eD2K 组件：{exc}") from exc
+        self.running = True
+        self._stopping = False
+        self._finished = False
+        threading.Thread(target=self._pump_stdout, name="ed2k-stdout", daemon=True).start()
+        threading.Thread(target=self._pump_stderr, name="ed2k-stderr", daemon=True).start()
+        payload = dict(spec)
+        payload.pop("_settings", None)
+        payload["cmd"] = "start"
+        self.send(payload)
+
+    def send(self, payload: dict) -> None:
+        """向引擎写一行 JSON；进程已退出时静默忽略。"""
+        if self.process is None or self.process.stdin is None:
+            return
+        line = json.dumps(payload, ensure_ascii=False)
+        try:
+            with self._write_lock:
+                self.process.stdin.write(line + "\n")
+                self.process.stdin.flush()
+        except (OSError, ValueError):
+            pass
+
+    def cancel(self) -> None:
+        """请求取消下载（保留隔离区里的进度），5 秒不退再强杀。"""
+        if self.process is None:
+            return
+        self._stopping = True
+        self.send({"cmd": "cancel"})
+        threading.Timer(5.0, self._force_kill).start()
+
+    def _force_kill(self) -> None:
+        if self.process is not None and self.process.poll() is None:
+            try:
+                self.process.kill()
+            except OSError:
+                pass
+
+    def shutdown(self, timeout: float = 3.0) -> None:
+        """退出前优雅关闭引擎。"""
+        if self.process is None:
+            return
+        self._stopping = True
+        self.send({"cmd": "shutdown"})
+        try:
+            self.process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            self._force_kill()
+        finally:
+            self.running = False
+
+    # ------------------------------------------------------------------ 读线程
+
+    def _pump_stdout(self) -> None:
+        assert self.process is not None and self.process.stdout is not None
+        for line in self.process.stdout:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            self._dispatch(payload)
+        # EOF：引擎退出了
+        code = self.process.poll() if self.process else None
+        self.running = False
+        if not self._stopping and not self._finished:
+            self.error = f"eD2K 组件异常退出（代码 {code}）"
+            self.on_event("error", self.error)
+        elif self._stopping and not self._finished:
+            self.on_event("stopped", "eD2K 任务已停止（进度保留在 .incoming 里）")
+
+    def _pump_stderr(self) -> None:
+        assert self.process is not None and self.process.stderr is not None
+        for _line in self.process.stderr:
+            pass  # 引擎日志只用于排查，不往界面上灌
+
+    def _dispatch(self, payload: dict) -> None:
+        kind = payload.get("event")
+        if kind == "progress":
+            self.name = str(payload.get("name") or self.name)
+            self.size = int(payload.get("size") or 0)
+            self.verified = int(payload.get("verified") or 0)
+            self.peers = int(payload.get("peers") or 0)
+            self.sources = int(payload.get("sources") or 0)
+            self._record_speed()
+        elif kind == "net":
+            self.servers = int(payload.get("servers") or 0)
+            self.kad_contacts = int(payload.get("kad") or 0)
+            self.shared = int(payload.get("shared") or 0)
+            self.low_id = bool(payload.get("low_id"))
+            port = payload.get("port")
+            self.listen_port = int(port) if port else None
+        elif kind == "task":
+            self.name = str(payload.get("name") or self.name)
+            self.size = int(payload.get("size") or self.size)
+            self.on_event("info", f"eD2K 任务：{self.name}（{format_bytes(self.size)}）")
+        elif kind == "log":
+            self.on_event("info", str(payload.get("message") or ""))
+        elif kind == "seed":
+            self.seeding = int(payload.get("files") or 0)
+            self.on_event("info", f"已加入共享，继续做种（{self.seeding} 个文件）")
+        elif kind == "done":
+            self._finished = True
+            self.running = False
+            path = str(payload.get("path") or "")
+            self.on_event("done", path)
+            self.send({"cmd": "shutdown"})
+        elif kind == "cancelled":
+            self._finished = True
+            self.running = False
+            self.on_event("stopped", "eD2K 任务已取消")
+        elif kind == "error":
+            message = str(payload.get("message") or "未知错误")
+            self.error = message
+            if payload.get("fatal"):
+                self._finished = True
+                self.running = False
+            self.on_event("error" if payload.get("fatal") else "degrade", message)
+        elif kind == "bye":
+            self.running = False
+
+    def _record_speed(self) -> None:
+        """用 3 秒滑动窗口估算瞬时速度。"""
+        now = time.time()
+        self._samples.append((now, self.verified))
+        while len(self._samples) > 2 and now - self._samples[0][0] > 3.0:
+            self._samples.popleft()
+        if len(self._samples) >= 2:
+            first_t, first_bytes = self._samples[0]
+            span = now - first_t
+            if span > 0.2:
+                self.speed = max(0.0, (self.verified - first_bytes) / span)
+
+    # ------------------------------------------------------------------ 查询
+
+    def snapshot(self) -> Tuple[int, int, float]:
+        """返回 (已校验字节, 总字节, 瞬时速度)，与 DownloadEngine.snapshot 对齐。"""
+        return self.verified, self.size, self.speed
+
+    def status_text(self) -> str:
+        """状态栏用的一行摘要。"""
+        parts = [f"服务器 {self.servers}"]
+        if self.listen_port:
+            parts.append(f"端口 {self.listen_port}")
+        parts.append("Low-ID" if self.low_id else "High-ID")
+        parts.append(f"源 {self.sources}")
+        parts.append(f"活跃 {self.peers}")
+        if self.kad_contacts:
+            parts.append(f"Kad {self.kad_contacts}")
+        if self.seeding:
+            parts.append(f"做种 {self.seeding}")
+        return " · ".join(parts)
+
+
+# --------------------------------------------------------------------------- #
+
 class DownloadApp:
     """tkinter 图形界面：唯一对外入口。"""
 
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.engine: Optional[DownloadEngine] = None
+        self.bridge: Optional[Ed2kBridge] = None
+        self.is_ed2k_task = False
+        self._ed2k_target: Optional[Path] = None
         self.events: "queue.Queue[Tuple[str, str]]" = queue.Queue()
 
         # 读取用户设置：默认保存目录（缺省即系统“下载”目录）
@@ -1856,9 +2140,16 @@ class DownloadApp:
         ttk.Entry(main, textvariable=self.output_var).grid(
             row=3, column=1, columnspan=2, sticky="ew", pady=4
         )
-        ttk.Button(main, text="浏览...", width=7, command=self._browse_output).grid(
-            row=3, column=3, padx=(8, 0), pady=4
+        # 保存路径右侧：选文件 + 一键打开目标目录
+        output_buttons = ttk.Frame(main)
+        output_buttons.grid(row=3, column=3, sticky="e", padx=(8, 0), pady=4)
+        ttk.Button(output_buttons, text="浏览...", width=7, command=self._browse_output).pack(
+            side="left"
         )
+        self.open_dir_button = ttk.Button(
+            output_buttons, text="打开目录", width=9, command=self._open_output_dir
+        )
+        self.open_dir_button.pack(side="left", padx=(6, 0))
 
         # 参数区
         params = ttk.LabelFrame(main, text="下载参数", padding=12)
@@ -1872,9 +2163,10 @@ class DownloadApp:
         self.chunk_mb_var = tk.StringVar(value=self.initial_chunk_mb)
 
         ttk.Label(params, text="分片数").grid(row=0, column=0, sticky="w")
-        ttk.Spinbox(params, from_=1, to=1024, width=6, textvariable=self.shards_var).grid(
-            row=0, column=1, sticky="w", padx=(4, 6)
+        self.shards_spin = ttk.Spinbox(
+            params, from_=1, to=1024, width=6, textvariable=self.shards_var
         )
+        self.shards_spin.grid(row=0, column=1, sticky="w", padx=(4, 6))
         # 常驻小字：最高支持分片数（探测到总大小后按 0.5 MB 最小分片收紧）
         self.shard_hint_var = tk.StringVar()
         self.shard_hint_label = ttk.Label(
@@ -1896,9 +2188,8 @@ class DownloadApp:
         chunk_row = ttk.Frame(params)
         chunk_row.grid(row=1, column=0, columnspan=8, sticky="w", pady=(8, 0))
         ttk.Label(chunk_row, text="分片大小 MB（可选）").pack(side="left")
-        ttk.Entry(chunk_row, width=8, textvariable=self.chunk_mb_var).pack(
-            side="left", padx=(4, 0)
-        )
+        self.chunk_entry = ttk.Entry(chunk_row, width=8, textvariable=self.chunk_mb_var)
+        self.chunk_entry.pack(side="left", padx=(4, 0))
         ttk.Label(
             params,
             text="提示：并发连接可以大于分片数，多余连接会把分片再切成子段，"
@@ -2009,13 +2300,42 @@ class DownloadApp:
         if token != self._resolve_token:
             return
         url = self.url_var.get().strip()
+        if is_ed2k_link(url):
+            # eD2K 链接自带文件名与大小，不需要探测
+            self._apply_ed2k_link(url)
+            return
         if not url.lower().startswith(("http://", "https://")):
             return
         if self.engine and self.engine.is_running():
             return
+        self._apply_http_link()
         threading.Thread(
             target=self._resolve_worker, args=(url, token), daemon=True
         ).start()
+
+    def _apply_ed2k_link(self, link: str) -> None:
+        """把 ed2k 链接里的文件名填进“保存到”，并提示是 eD2K 任务。"""
+        name, size = parse_ed2k_link(link)
+        current = self.output_var.get().strip()
+        if not current or current == self._auto_output:
+            base_dir = Path(current).parent if current else self.download_dir
+            target = str(base_dir / name)
+            if target != current:
+                self._set_auto_output(target)
+        # eD2K 不走 HTTP 分片：分片数与分片大小无意义，置灰避免误解
+        self.shards_spin.configure(state="disabled")
+        self.chunk_entry.configure(state="disabled")
+        self._set_status(
+            f"eD2K 任务：{name}（{format_bytes(size)}）· 分片参数不适用，并发连接即最大对等连接数"
+        )
+
+    def _apply_http_link(self) -> None:
+        """切回普通 HTTP 链接时恢复分片相关控件。"""
+        for widget in (self.shards_spin, self.chunk_entry):
+            try:
+                widget.configure(state="normal")
+            except tk.TclError:
+                pass
 
     def _resolve_worker(self, url: str, token: int) -> None:
         """后台探测一次，只为拿到跳转后的真实文件名（失败静默）。"""
@@ -2061,6 +2381,35 @@ class DownloadApp:
         )
         if path:
             self.output_var.set(path)
+
+    def _open_output_dir(self) -> None:
+        """在资源管理器里打开当前任务的保存目录。
+
+        优先取“保存到”所在目录；为空则退回默认保存目录。路径不存在时只提示，
+        不会自动创建目录（避免用户在不知情的地方多出文件夹）。
+        """
+        raw = self.output_var.get().strip()
+        if raw:
+            candidate = Path(raw).expanduser()
+            # 填的是已存在的目录就直接打开它，否则打开其父目录
+            directory = candidate if candidate.is_dir() else candidate.parent
+        else:
+            directory = Path(self.download_dir)
+        if not directory.is_dir():
+            directory = Path(self.download_dir)
+        if not directory.is_dir():
+            messagebox.showinfo(
+                "目录不存在",
+                f"下载目录还不存在：\n{directory}\n\n可以在“设置”里指定默认保存目录。",
+                parent=self.root,
+            )
+            return
+        try:
+            os.startfile(str(directory))  # noqa: S606 - 只在 Windows 上打开资源管理器
+        except OSError as exc:
+            messagebox.showerror(
+                "打开失败", f"无法打开目录：\n{directory}\n\n{exc}", parent=self.root
+            )
 
     # ------------------------------------------------------------------ #
     # 设置
@@ -2125,6 +2474,34 @@ class DownloadApp:
             self.status_var.set(
                 "已信任系统证书库" if self.trust_system_ca else "已改用内置 certifi 证书"
             )
+
+    def apply_ed2k_settings(
+        self, use_kad: bool, seed: bool, tcp_port: str, udp_port: str
+    ) -> bool:
+        """保存 eD2K 偏好：Kad、做种、监听端口。端口非法时拒绝保存并提示。"""
+        try:
+            tcp = int(str(tcp_port).strip())
+            udp = int(str(udp_port).strip())
+            if not (1 <= tcp <= 65535 and 1 <= udp <= 65535 and tcp != udp):
+                raise ValueError
+        except ValueError:
+            messagebox.showerror(
+                "设置",
+                "eD2K 端口必须是 1–65535 之间的整数，且 TCP 与 UDP 不能相同",
+                parent=self.root,
+            )
+            return False
+
+        self.settings["ed2k_use_kad"] = bool(use_kad)
+        self.settings["ed2k_seed"] = bool(seed)
+        self.settings["ed2k_tcp_port"] = tcp
+        self.settings["ed2k_udp_port"] = udp
+        try:
+            save_settings(self.settings)
+        except OSError as exc:
+            self.status_var.set(f"设置保存失败：{exc}")
+            return False
+        return True
 
     def _open_settings(self) -> None:
         """设置窗口：调整“新建任务”的默认保存目录并持久化。"""
@@ -2195,8 +2572,53 @@ class DownloadApp:
             justify="left",
         ).grid(row=6, column=0, columnspan=2, sticky="w", pady=(2, 12))
 
+        # ---- eD2K ----
+        ttk.Label(body, text="eD2K", style="Section.TLabel").grid(
+            row=7, column=0, columnspan=2, sticky="w"
+        )
+        kad_var = tk.BooleanVar(value=bool(self.settings.get("ed2k_use_kad", True)))
+        seed_var = tk.BooleanVar(value=bool(self.settings.get("ed2k_seed", True)))
+        ttk.Checkbutton(body, text="启用 Kad（不依赖服务器也能找源）", variable=kad_var).grid(
+            row=8, column=0, sticky="w", pady=(8, 0)
+        )
+        ttk.Checkbutton(body, text="下载完成后继续做种（上传）", variable=seed_var).grid(
+            row=8, column=1, sticky="w", pady=(8, 0)
+        )
+
+        ports = ttk.Frame(body)
+        ports.grid(row=9, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        ttk.Label(ports, text="监听端口 TCP").pack(side="left")
+        tcp_var = tk.StringVar(
+            value=str(
+                _as_int(self.settings.get("ed2k_tcp_port"), ED2K_DEFAULT_TCP_PORT, 1, 65535)
+            )
+        )
+        ttk.Entry(ports, textvariable=tcp_var, width=7).pack(side="left", padx=(6, 14))
+        ttk.Label(ports, text="UDP").pack(side="left")
+        udp_var = tk.StringVar(
+            value=str(
+                _as_int(self.settings.get("ed2k_udp_port"), ED2K_DEFAULT_UDP_PORT, 1, 65535)
+            )
+        )
+        ttk.Entry(ports, textvariable=udp_var, width=7).pack(side="left", padx=(6, 0))
+
+        engine_path = Ed2kBridge.find_engine(self.settings)
+        if engine_path is None:
+            engine_hint = "组件：未安装 · 首次下载 eD2K 链接时会提示按需安装（约 15 MB，GPL-3.0）"
+        elif engine_path.suffix.lower() == ".py":
+            engine_hint = "组件：开发模式（直接调用 ed2k-engine/engine.py）"
+        else:
+            engine_hint = f"组件：已安装（{engine_path.name}）"
+        ttk.Label(
+            body,
+            text=engine_hint,
+            style="Hint.TLabel",
+            wraplength=660,
+            justify="left",
+        ).grid(row=10, column=0, columnspan=2, sticky="w", pady=(6, 12))
+
         actions = ttk.Frame(body)
-        actions.grid(row=7, column=0, columnspan=2, sticky="ew")
+        actions.grid(row=11, column=0, columnspan=2, sticky="ew")
         ttk.Button(
             actions, text="恢复系统下载目录", command=lambda: dir_var.set(str(system_downloads_dir()))
         ).pack(side="left")
@@ -2204,6 +2626,9 @@ class DownloadApp:
         def _save() -> None:
             if self.apply_download_dir(dir_var.get(), dialog):
                 self.apply_trust_system_ca(bool(trust_var.get()))
+                self.apply_ed2k_settings(
+                    bool(kad_var.get()), bool(seed_var.get()), tcp_var.get(), udp_var.get()
+                )
                 dialog.destroy()
 
         ttk.Button(actions, text="取消", command=dialog.destroy).pack(side="right")
@@ -2265,8 +2690,13 @@ class DownloadApp:
     def _start(self) -> None:
         if self.engine and self.engine.is_running():
             return
+        if self.bridge and self.bridge.running:
+            return
 
         url = self.url_var.get().strip()
+        if is_ed2k_link(url):
+            self._start_ed2k(url)
+            return
         if not url.lower().startswith(("http://", "https://")):
             messagebox.showerror("参数错误", "请填写以 http:// 或 https:// 开头的下载链接")
             return
@@ -2340,10 +2770,109 @@ class DownloadApp:
         self.status_var.set("正在探测目标链接 ...")
         self.engine.start()
 
+    def _ed2k_state_dir(self) -> Path:
+        """eD2K 的节点缓存/身份目录，放在配置目录下，卸载时随配置一起清。"""
+        return config_path().parent / "ed2k-state"
+
+    def _start_ed2k(self, link: str) -> None:
+        """启动 eD2K 任务：交给独立引擎进程，界面只负责展示进度。"""
+        name, size = parse_ed2k_link(link)
+        output = self.output_var.get().strip() or str(Path(self.download_dir) / name)
+        self.output_var.set(output)
+        target = Path(output).expanduser()
+        if target.exists() and target.is_dir():
+            messagebox.showerror("参数错误", "保存路径是一个目录，请指定文件名")
+            return
+        if target.exists():
+            if not messagebox.askyesno(
+                "确认覆盖", f"目标文件已存在：\n{target}\n\n继续将覆盖该文件，是否继续？"
+            ):
+                return
+
+        if Ed2kBridge.find_engine(self.settings) is None:
+            answer = messagebox.askyesno(
+                "缺少 eD2K 组件",
+                "eD2K 下载需要一个独立的引擎组件（Ed2kEngine.exe，GPL-3.0，约 15 MB），"
+                "当前没有安装。\n\n是否现在下载并安装？",
+            )
+            if answer:
+                self._download_ed2k_component()
+            return
+
+        if self.bridge is None:
+            self.bridge = Ed2kBridge(lambda kind, text: self.events.put((kind, text)))
+        try:
+            max_peers = max(1, min(int(self.concurrency_var.get()), 64))
+        except (ValueError, tk.TclError):
+            max_peers = 16
+
+        spec = {
+            "link": link,
+            "out_dir": str(target.parent),
+            "state_dir": str(self._ed2k_state_dir()),
+            "tcp_port": _as_int(
+                self.settings.get("ed2k_tcp_port"), ED2K_DEFAULT_TCP_PORT, 1, 65535
+            ),
+            "udp_port": _as_int(
+                self.settings.get("ed2k_udp_port"), ED2K_DEFAULT_UDP_PORT, 1, 65535
+            ),
+            "use_kad": bool(self.settings.get("ed2k_use_kad", True)),
+            "seed": bool(self.settings.get("ed2k_seed", True)),
+            "max_peers": max_peers,
+            "nickname": "HighSpeedDownloader",
+            "_settings": self.settings,
+        }
+        try:
+            self.bridge.start(spec)
+        except DownloadError as exc:
+            messagebox.showerror("eD2K 启动失败", str(exc))
+            return
+
+        self.is_ed2k_task = True
+        self._ed2k_target = target
+        self._set_running(True)
+        self._set_progress(0, size, 0.0)
+        self.status_var.set("eD2K：正在连接服务器与 Kad …")
+
+    def _download_ed2k_component(self) -> None:
+        """按需下载 eD2K 组件（独立 GPL 组件，单独发布为一个 zip 资产）。"""
+        url = (
+            "https://github.com/Jayy-yang/high-speed-downloader/releases/download/"
+            f"v{APP_VERSION}/Ed2kEngine.zip"
+        )
+        self.status_var.set("正在下载 eD2K 组件 …")
+
+        def worker() -> None:
+            target = config_path().parent / "ed2k"
+            try:
+                with build_http_session(self.trust_system_ca) as session:
+                    with session.get(url, timeout=(10, 300), stream=True) as resp:
+                        resp.raise_for_status()
+                        payload = resp.content
+                archive = target.parent / "Ed2kEngine.zip"
+                archive.parent.mkdir(parents=True, exist_ok=True)
+                archive.write_bytes(payload)
+                with zipfile.ZipFile(archive) as bundle:
+                    bundle.extractall(target)
+                engine = target / ED2K_ENGINE_NAME
+                if not engine.is_file():
+                    raise DownloadError("压缩包里没有找到 Ed2kEngine.exe")
+                self.settings["ed2k_engine"] = str(engine)
+                save_settings(self.settings)
+                self.events.put(("info", f"eD2K 组件已安装：{engine}"))
+            except Exception as exc:  # 网络/解压失败都按同一条提示处理
+                self.events.put(("error", f"eD2K 组件安装失败：{exc}"))
+
+        threading.Thread(target=worker, name="ed2k-component", daemon=True).start()
+
     def _stop(self) -> None:
         if self.engine and self.engine.is_running():
             self.engine.cancel()
             self.status_var.set("正在停止，等待分片收尾 ...")
+            self.stop_button.configure(state="disabled")
+        elif self.bridge and self.bridge.running:
+            self.bridge.cancel()
+            self.status_var.set("正在停止 eD2K 任务，已下载部分会保留 ...")
             self.stop_button.configure(state="disabled")
 
     def _on_close(self) -> None:
@@ -2355,6 +2884,13 @@ class DownloadApp:
                 return
             self.engine.cancel()
             self.engine.wait(timeout=3.0)
+        if self.bridge and self.bridge.running:
+            if not messagebox.askyesno(
+                "确认退出",
+                "eD2K 任务仍在进行，退出会保留已下载的部分，下次可续传。确定退出吗？",
+            ):
+                return
+            self.bridge.shutdown()
         self._save_ui_state()
         self.root.destroy()
 
@@ -2372,6 +2908,8 @@ class DownloadApp:
                 kind, text = self.events.get_nowait()
                 self._append_event(kind, text)
                 if kind == "done":
+                    if self.is_ed2k_task and text:
+                        self._finish_ed2k(text)
                     self.status_var.set("下载完成")
                     self._set_running(False)
                     self.progress_bar.stop()
@@ -2406,7 +2944,35 @@ class DownloadApp:
                         self._max_shards = limit
                         self._refresh_shard_hint()
 
+        if self.bridge and self.bridge.running:
+            done, total, speed = self.bridge.snapshot()
+            self._set_progress(done, total, speed)
+            self._set_status(f"eD2K：{self.bridge.status_text()}")
+
         self.root.after(120, self._poll_events)
+
+    def _finish_ed2k(self, path_text: str) -> None:
+        """eD2K 完成后的收尾：把引擎输出目录里的文件挪到用户指定路径。"""
+        target = self._ed2k_target
+        self.is_ed2k_task = False
+        if target is None:
+            return
+        source = Path(path_text)
+        try:
+            if source.resolve() == target.resolve():
+                return
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if target.exists():
+                target.unlink()
+            os.replace(source, target)
+            self._append_event("info", f"已保存到：{target}")
+        except OSError as exc:
+            self._append_event("degrade", f"文件已下载，但移动到目标路径失败：{exc}")
+
+    def _set_status(self, text: str) -> None:
+        """写状态栏：超长文本截断，避免把窗口撑宽。"""
+        limit = 78
+        self.status_var.set(text if len(text) <= limit else text[: limit - 1] + "…")
 
     def _set_progress(self, done: int, total: int, speed: float) -> None:
         if total > 0:
@@ -2441,8 +3007,55 @@ class DownloadApp:
 # 入口
 # --------------------------------------------------------------------------- #
 
+def run_selfcheck() -> dict:
+    """自检：验证冻结后依赖是否齐全、组件能否找到。
+
+    单文件版没有控制台，结果写到 ``%TEMP%\\hsd-selfcheck.json`` 并同时返回，
+    发布前用它确认「打包有没有漏模块」。
+    """
+    report: dict = {"version": APP_VERSION, "frozen": bool(getattr(sys, "frozen", False))}
+    report["python"] = sys.version.split()[0]
+    try:
+        import aiohttp
+
+        report["aiohttp"] = aiohttp.__version__
+    except Exception as exc:  # noqa: BLE001
+        report["aiohttp"] = f"ERROR: {exc}"
+    try:
+        import requests
+
+        report["requests"] = requests.__version__
+    except Exception as exc:  # noqa: BLE001
+        report["requests"] = f"ERROR: {exc}"
+    try:
+        report["tk"] = tk.TkVersion
+    except Exception as exc:  # noqa: BLE001
+        report["tk"] = f"ERROR: {exc}"
+    engine = Ed2kBridge.find_engine(load_settings())
+    report["ed2k_engine"] = str(engine) if engine else None
+    report["download_dir"] = str(system_downloads_dir())
+    return report
+
+
+def write_selfcheck(report: dict) -> Path:
+    """把自检结果写到临时目录，返回文件路径。"""
+    target = Path(tempfile.gettempdir()) / "hsd-selfcheck.json"
+    try:
+        target.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError:
+        pass
+    return target
+
+
 def main() -> None:
-    """启动图形界面。"""
+    """启动图形界面；``--selfcheck`` / ``--version`` 用于打包后自检。"""
+    arguments = set(sys.argv[1:])
+    if "--version" in arguments:
+        write_selfcheck({"version": APP_VERSION})
+        return
+    if "--selfcheck" in arguments:
+        write_selfcheck(run_selfcheck())
+        return
     enable_dpi_awareness()
     root = tk.Tk()
     DownloadApp(root)

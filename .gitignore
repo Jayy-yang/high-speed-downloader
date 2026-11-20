@@ -7,3 +7,4 @@ tools/_tmp_settings/
 out/
 *.parts/
 .venv/
+old-release/

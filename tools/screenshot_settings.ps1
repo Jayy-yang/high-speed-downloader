@@ -1,4 +1,4 @@
-# Temporary: open the settings dialog and capture exactly its rectangle.
+﻿# Temporary: open the settings dialog and capture exactly its rectangle.
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Drawing
 Add-Type @"
